@@ -1,0 +1,36 @@
+---
+description: Enforce API request scheduler usage
+globs: ["**/*.py"]
+alwaysApply: true
+---
+
+# API Scheduler Rule
+
+To prevent concurrency issues and API throttling, always route outbound API calls through `request_scheduler.py` and always load API keys from `.env`.
+
+## Required behavior on every agent boot
+
+1. Check whether API-calling code is using `schedule_api_request(...)` (preferred) or a `RequestScheduler` flow that reads API keys from `.env`.
+2. If direct API calls are found, refactor them to run through the scheduler.
+3. Keep scheduler usage as the single entrypoint for network calls unless explicitly told otherwise.
+
+## Preferred usage pattern
+
+```python
+from request_scheduler import schedule_api_request
+
+result = await schedule_api_request(
+    lambda api_key: client.get(
+        "/z-api/endpoint",
+        headers={"x-api-key": api_key},
+    ),
+    request_name="z_api_get_endpoint",
+)
+```
+
+## Notes
+
+- Do not bypass the scheduler for concurrent workers, background tasks, or loops.
+- API keys must be sourced from `.env` via `get_required_api_key(...)`; do not hardcode keys.
+- Use meaningful `request_name` values for debugging retry failures.
+- Tune limits in `SchedulerConfig` if throughput needs change.
