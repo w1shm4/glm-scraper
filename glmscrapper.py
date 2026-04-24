@@ -2,9 +2,9 @@ import json
 import asyncio
 import os
 from pathlib import Path
-import pandas as pd
-import requests
-from bs4 import BeautifulSoup
+import pandas as pd  # pyright: ignore[reportMissingImports]
+import requests  # pyright: ignore[reportMissingModuleSource]
+from bs4 import BeautifulSoup  # pyright: ignore[reportMissingModuleSource]
 from request_scheduler import schedule_api_request, schedule_request
 
 API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
