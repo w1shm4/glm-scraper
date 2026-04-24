@@ -1,20 +1,36 @@
 import json
-import time
-import sys
+import asyncio
+import os
+from pathlib import Path
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from ddgs import DDGS
+from request_scheduler import schedule_api_request, schedule_request
 
-API_KEY = "5224498cc5004c18828634cc2c7896c1.IFqKu1J46oECwOF9"
 API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+LOCK_FILE_PATH = Path(".glmscrapper.lock")
 
-def call_glm(prompt_text, retries=3):
-    headers = {
-        "Authorization": f"Bearer {API_KEY}",
-        "Content-Type": "application/json"
-    }
-    
+
+def acquire_process_lock(lock_path: Path = LOCK_FILE_PATH) -> None:
+    """
+    Ensure only one glmscrapper process runs at a time.
+    Uses atomic file creation so concurrent starts cannot both succeed.
+    """
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as lock_file:
+            lock_file.write(str(os.getpid()))
+    except FileExistsError as exc:
+        raise RuntimeError(
+            f"Another glmscrapper instance is already running (lock: {lock_path})."
+        ) from exc
+
+
+def release_process_lock(lock_path: Path = LOCK_FILE_PATH) -> None:
+    if lock_path.exists():
+        lock_path.unlink()
+
+async def call_glm(prompt_text):
     data = {
         "model": "glm-4.5",  
         "messages": [
@@ -36,46 +52,55 @@ def call_glm(prompt_text, retries=3):
             {"role": "user", "content": f"Extract info from this text:\n\n{prompt_text}"}
         ]
     }
-    
-    for attempt in range(retries):
-        try:
-            response = requests.post(API_URL, headers=headers, json=data, timeout=45)
-            response.raise_for_status() 
-            
-            resp_json = response.json()
-            content = resp_json['choices'][0]['message']['content']
-            
-            # Clean up markdown block if present
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.startswith("```"):
-                content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-                
-            return json.loads(content.strip())
-            
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == 429:
-                wait_time = (attempt + 1) * 10
-                print(f"    [!] Rate limited by GLM (429). Waiting {wait_time}s and retrying...")
-                time.sleep(wait_time)
-                continue
-            else:
-                print(f"    [CRITICAL ERROR] The GLM API returned an error: {e}")
-                return None
-        except Exception as e:
-            print(f"    Error parsing GLM response: {e}")
-            return None
-            
-    print("    [!] Max retries reached for GLM API. Skipping this lead.")
-    return None
 
-def fetch_and_extract(url):
+    def _make_glm_request(api_key: str):
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        return asyncio.to_thread(
+            requests.post,
+            API_URL,
+            headers=headers,
+            json=data,
+            timeout=45,
+        )
+
+    try:
+        response = await schedule_api_request(
+            _make_glm_request,
+            request_name="glm_chat_completions",
+        )
+        response.raise_for_status()
+
+        resp_json = response.json()
+        content = resp_json["choices"][0]["message"]["content"]
+
+        # Clean up markdown block if present
+        if content.startswith("```json"):
+            content = content[7:]
+        if content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+
+        return json.loads(content.strip())
+    except requests.exceptions.HTTPError as e:
+        print(f"    [CRITICAL ERROR] The GLM API returned an error: {e}")
+        return None
+    except Exception as e:
+        print(f"    Error parsing GLM response: {e}")
+        return None
+
+
+async def fetch_and_extract(url):
     try:
         print(f"Scraping: {url}")
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        response = requests.get(url, headers=headers, timeout=15)
+        response = await schedule_request(
+            lambda: asyncio.to_thread(requests.get, url, headers=headers, timeout=15),
+            request_name="website_scrape_get",
+        )
         response.raise_for_status()
         
         soup = BeautifulSoup(response.text, 'html.parser')
@@ -90,13 +115,13 @@ def fetch_and_extract(url):
             print("  Not enough text content found.")
             return None
             
-        return call_glm(text)
+        return await call_glm(text)
         
     except Exception as e:
         print(f"  Failed to scrape {url}: {e}")
         return None
 
-def main():
+async def main():
     print("Preparing list of Massachusetts Hospice Agencies...")
     
     # Hardcoded list of prominent MA hospice agencies based on search results and directories
@@ -126,12 +151,12 @@ def main():
     leads = []
     
     for url in target_urls:
-        data = fetch_and_extract(url)
+        data = await fetch_and_extract(url)
         if data:
             data['Source URL'] = url
             leads.append(data)
             print(f"  Successfully extracted data for: {data.get('Agency Name', 'Unknown')}")
-        time.sleep(2) # Be polite
+        await asyncio.sleep(2) # Be polite
         
     if leads:
         df = pd.DataFrame(leads)
@@ -142,4 +167,13 @@ def main():
         print("\nNo leads were successfully extracted.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        acquire_process_lock()
+    except RuntimeError as exc:
+        print(f"[LOCK] {exc}")
+        raise SystemExit(1) from exc
+
+    try:
+        asyncio.run(main())
+    finally:
+        release_process_lock()
